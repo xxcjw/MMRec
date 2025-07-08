@@ -1,0 +1,27 @@
+embedding_size: 128  # 最终融合后的物品嵌入维度
+
+
+# AlphaFuse配置
+use_alphafuse: [True]  # 是否使用AlphaFuse模块
+null_thres: None           # 零空间阈值，设为null时使用null_dim
+null_dim: [32]              # 可训练ID嵌入的维度，将注入到融合语义的末尾
+standardization: True  # 是否标准化
+cover: False              # 是否覆盖零空间（AlphaFuse默认是加法注入，所以设置为False）
+ID_space: "singular"        # ID嵌入空间类型: singular, euclidean
+inject_space: "singular"    # 注入空间类型: singular, euclidean  
+emb_init_type: "xavier"     # ID嵌入初始化方式
+emb_type: "semantic"              # ID嵌入类型: ID, ID+semantic, semantic
+
+# reg_weight: [0.0, 1e-05, 1e-04, 1e-03]
+reg_weight: [0.0]
+
+n_mm_layers: 1
+n_ui_layers: 2
+knn_k: 10
+
+mm_image_weight: 0.1
+dropout: [0.8]
+visualize_every_n_epochs: 80
+visualization_save_dir: './embedding_visualizations'
+
+hyper_parameters: ["dropout", "reg_weight", "use_alphafuse", "null_dim"]
