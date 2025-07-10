@@ -322,17 +322,105 @@ class LLMNULL(GeneralRecommender):
 
 
 
-# 新增的 AlphaFuse 的物品嵌入模块
-class AlphaFuseItemEmbedder(nn.Module):
-    
-    def __init__(self, v_feat, t_feat, device, embedding_dim, null_thres, null_dim, 
-                 standardization, cover, ID_space, inject_space, emb_init_type, emb_type):
-        super(AlphaFuseItemEmbedder, self).__init__()
+# Cross-modal attention mechanism for enhanced fusion
+class CrossModalAttention(nn.Module):
+    def __init__(self, modal_dim, attention_dim=None):
+        super(CrossModalAttention, self).__init__()
+        if attention_dim is None:
+            attention_dim = modal_dim
         
-        self.embedding_dim = embedding_dim  # 总嵌入维度 (256)
-        self.modal_dim = embedding_dim // 2  # 每个模态的维度 (128)
-        self.v_feat = v_feat
-        self.t_feat = t_feat
+        self.modal_dim = modal_dim
+        self.attention_dim = attention_dim
+        
+        # Query, Key, Value projections
+        self.query_proj = nn.Linear(modal_dim, attention_dim)
+        self.key_proj = nn.Linear(modal_dim, attention_dim)
+        self.value_proj = nn.Linear(modal_dim, attention_dim)
+        
+        # Output projection to maintain dimension
+        self.output_proj = nn.Linear(attention_dim, modal_dim)
+        
+        # Scale factor for attention
+        self.scale = attention_dim ** -0.5
+        
+    def forward(self, visual_emb, text_emb):
+        """
+        Compute cross-modal attention between visual and text embeddings
+        
+        Args:
+            visual_emb: [batch_size, modal_dim] visual embeddings
+            text_emb: [batch_size, modal_dim] text embeddings
+            
+        Returns:
+            v2t_enhanced: visual embeddings enhanced by text information
+            t2v_enhanced: text embeddings enhanced by visual information
+        """
+        batch_size = visual_emb.size(0)
+        
+        # Visual-to-Text attention
+        v_query = self.query_proj(visual_emb)  # [batch_size, attention_dim]
+        t_key = self.key_proj(text_emb)        # [batch_size, attention_dim]
+        t_value = self.value_proj(text_emb)    # [batch_size, attention_dim]
+        
+        # Compute attention scores
+        v2t_scores = torch.matmul(v_query.unsqueeze(1), t_key.unsqueeze(2)) * self.scale  # [batch_size, 1, 1]
+        v2t_attention = torch.softmax(v2t_scores.squeeze(-1), dim=-1)  # [batch_size, 1]
+        v2t_attended = torch.matmul(v2t_attention.unsqueeze(1), t_value.unsqueeze(1)).squeeze(1)  # [batch_size, attention_dim]
+        v2t_enhanced = visual_emb + self.output_proj(v2t_attended)
+        
+        # Text-to-Visual attention
+        t_query = self.query_proj(text_emb)    # [batch_size, attention_dim]
+        v_key = self.key_proj(visual_emb)      # [batch_size, attention_dim]
+        v_value = self.value_proj(visual_emb)  # [batch_size, attention_dim]
+        
+        # Compute attention scores
+        t2v_scores = torch.matmul(t_query.unsqueeze(1), v_key.unsqueeze(2)) * self.scale  # [batch_size, 1, 1]
+        t2v_attention = torch.softmax(t2v_scores.squeeze(-1), dim=-1)  # [batch_size, 1]
+        t2v_attended = torch.matmul(t2v_attention.unsqueeze(1), v_value.unsqueeze(1)).squeeze(1)  # [batch_size, attention_dim]
+        t2v_enhanced = text_emb + self.output_proj(t2v_attended)
+        
+        return v2t_enhanced, t2v_enhanced
+
+
+# Unified null space for fused multi-modal embeddings
+class UnifiedNullSpace(nn.Module):
+    def __init__(self, embedding_dim, null_dim, standardization=True):
+        super(UnifiedNullSpace, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.null_dim = null_dim
+        self.standardization = standardization
+        
+    def inject(self, fused_semantic, unified_id_emb, cover=False):
+        """
+        Inject unified ID embeddings into the fused semantic space
+        
+        Args:
+            fused_semantic: [batch_size, embedding_dim] fused semantic embeddings
+            unified_id_emb: [batch_size, null_dim] unified ID embeddings
+            cover: whether to cover or add to the null space
+            
+        Returns:
+            final_embedding: [batch_size, embedding_dim] final fused embeddings
+        """
+        result = fused_semantic.clone()
+        
+        if cover:
+            # Cover mode: replace the null space with ID embeddings
+            result[..., -self.null_dim:] = unified_id_emb
+        else:
+            # Add mode: add ID embeddings to the null space
+            result[..., -self.null_dim:] = fused_semantic[..., -self.null_dim:] + unified_id_emb
+            
+        return result
+
+
+# Improved multi-modal AlphaFuse module
+class MultiModalAlphaFuse(nn.Module):
+    def __init__(self, v_feat, t_feat, device, embedding_dim, null_thres, null_dim,
+                 standardization, cover, ID_space, inject_space, emb_init_type, emb_type):
+        super(MultiModalAlphaFuse, self).__init__()
+        
+        self.embedding_dim = embedding_dim
         self.null_dim = null_dim
         self.standardization = standardization
         self.cover = cover
@@ -340,70 +428,72 @@ class AlphaFuseItemEmbedder(nn.Module):
         self.inject_space = inject_space
         self.emb_init_type = emb_init_type
         self.emb_type = emb_type
+        self.device = device
         
-        # self.device = device
-        # self.text_bn = nn.BatchNorm1d(t_feat.shape[1],eps=1e-5).to(self.device) 
-        # self.visual_bn = nn.BatchNorm1d(v_feat.shape[1],eps=1e-5).to(self.device) 
-        # text_raw_feats = t_feat
-        # visual_raw_feats = v_feat
-        # text_l2_norm_feats = F.normalize(text_raw_feats, p=2, dim=1)
-        # visual_l2_norm_feats = F.normalize(visual_raw_feats, p=2, dim=1)
-        # self.t_feat = self.text_bn(text_l2_norm_feats)
-        # self.v_feat = self.visual_bn(visual_l2_norm_feats)
-
-        # 如果有视觉特征，构建视觉模态的空间分解
+        # Modal dimension for each modality (half of total embedding dim)
+        self.modal_dim = embedding_dim // 2
+        
+        # Feature storage
+        self.v_feat = v_feat
+        self.t_feat = t_feat
+        
+        # Build modal projectors and semantic embeddings
+        self._build_modal_spaces()
+        
+        # Cross-modal attention mechanism
+        if self.v_feat is not None and self.t_feat is not None:
+            self.cross_modal_attention = CrossModalAttention(self.modal_dim)
+            # Fusion layer to combine enhanced modalities
+            self.fusion_layer = nn.Sequential(
+                nn.Linear(2 * self.modal_dim, embedding_dim),
+                nn.ReLU(),
+                nn.Linear(embedding_dim, embedding_dim)
+            )
+        else:
+            # If only one modality, use projection to full dimension
+            self.single_modal_proj = nn.Linear(self.modal_dim, embedding_dim)
+        
+        # Unified null space and ID embeddings
+        self.unified_null_space = UnifiedNullSpace(embedding_dim, null_dim, standardization)
+        n_items = v_feat.size(0) if v_feat is not None else t_feat.size(0)
+        self.unified_id_embeddings = nn.Embedding(n_items, null_dim)
+        self._init_embedding(self.unified_id_embeddings, emb_init_type)
+        
+    def _build_modal_spaces(self):
+        """Build semantic embeddings for each modality"""
         if self.v_feat is not None:
-            v_feat = self.v_feat.detach().cpu().numpy()
-            self.v_nullity = self._construct_modal_space(
-                v_feat, "visual", null_thres, null_dim
-            )
-            # 初始化视觉ID嵌入
-            self.v_ID_embeddings = nn.Embedding(num_embeddings=self.v_feat.size(0),embedding_dim=self.v_nullity )
-            self._init_embedding(self.v_ID_embeddings, emb_init_type)
+            v_feat_np = self.v_feat.detach().cpu().numpy()
+            self._construct_modal_space(v_feat_np, "visual", self.modal_dim)
         
-        # 如果有文本特征，构建文本模态的空间分解
         if self.t_feat is not None:
-            t_feat = self.t_feat.detach().cpu().numpy()
-            self.t_nullity = self._construct_modal_space(
-                t_feat, "text", null_thres, null_dim
-            )
-            # 初始化文本ID嵌入
-            self.t_ID_embeddings = nn.Embedding(num_embeddings=self.t_feat.size(0), embedding_dim=self.t_nullity  )
-            self._init_embedding(self.t_ID_embeddings, emb_init_type)
+            t_feat_np = self.t_feat.detach().cpu().numpy()
+            self._construct_modal_space(t_feat_np, "text", self.modal_dim)
     
-    def _construct_modal_space(self, feat_matrix, modal_name, null_thres, null_dim):
-        
+    def _construct_modal_space(self, feat_matrix, modal_name, target_dim):
+        """Construct semantic space for a modality"""
         print(f"构建{modal_name}模态空间分解...")
         mean = np.mean(feat_matrix, axis=0)
         cov = np.cov(feat_matrix - mean, rowvar=False)
         U, S, _ = np.linalg.svd(cov, full_matrices=False)
         
-        # 确定零空间维度
-        if null_dim is not None:
-            nullity = null_dim
-        elif null_thres is not None:
-            indices_null = np.where(S <= null_thres)[0]
-            nullity = len(indices_null)
-        else:
-            nullity = min(32, feat_matrix.shape[1] // 4)  # 默认为特征维度的1/4
-        print(f"{modal_name}模态零空间维度: {nullity}")
-        
         if self.standardization:
             P = U.dot(np.diag(np.sqrt(1/S)))
-        projected_feat = (feat_matrix - mean).dot(P[:,:self.modal_dim])
+        else:
+            P = U
         
-        # 创建冻结的语义嵌入
+        # Project features to target dimension
+        projected_feat = (feat_matrix - mean).dot(P[:, :target_dim])
+        
+        # Create frozen semantic embedding
         semantic_emb = nn.Embedding.from_pretrained(
             torch.tensor(projected_feat, dtype=torch.float32),
             freeze=True
         )
         setattr(self, f'{modal_name}_semantic_embeddings', semantic_emb)
-        
-        return nullity  
+        print(f"{modal_name}模态语义空间维度: {target_dim}")
     
-
     def _init_embedding(self, embedding_layer, emb_init_type):
-        """初始化ID嵌入层"""
+        """Initialize embedding layers"""
         if emb_init_type == "uniform":
             nn.init.uniform_(embedding_layer.weight, a=0.0, b=1.0)
         elif emb_init_type == "normal":
@@ -420,81 +510,122 @@ class AlphaFuseItemEmbedder(nn.Module):
             nn.init.xavier_uniform_(embedding_layer.weight, gain=1.0)
     
     def forward(self, item_ids):
-        embeddings = []
+        """
+        Forward pass for improved multi-modal fusion
         
-        # 处理视觉模态
+        Args:
+            item_ids: [batch_size] item indices
+            
+        Returns:
+            final_embedding: [batch_size, embedding_dim] fused embeddings
+        """
+        # Get semantic embeddings for each modality
+        modal_embeddings = []
+        
         if self.v_feat is not None:
-            v_emb = self._inject_visual(item_ids, self.emb_type)
-            embeddings.append(v_emb)
+            visual_semantic = self.visual_semantic_embeddings(item_ids)
+            modal_embeddings.append(visual_semantic)
         
-        # 处理文本模态
         if self.t_feat is not None:
-            t_emb = self._inject_text(item_ids, self.emb_type)
-            embeddings.append(t_emb)
+            text_semantic = self.text_semantic_embeddings(item_ids)
+            modal_embeddings.append(text_semantic)
         
-        # 拼接两个模态的嵌入
-        if len(embeddings) == 2:
-            # 两个模态都存在
-            return torch.cat(embeddings, dim=-1)
-        else :
-            # 只有一个模态，需要补齐到总维度
-            single_emb = embeddings[0]
-            padding = torch.zeros(single_emb.size(0), self.modal_dim, 
-                                device=single_emb.device, dtype=single_emb.dtype)
-            return torch.cat([single_emb, padding], dim=-1)
-
-
-
-    def _inject_visual(self, item_ids, emb_type):
-        """视觉模态的注入逻辑"""
-        # 获取语义嵌入（冻结，不参与梯度计算）
-        semantic_emb = self.visual_semantic_embeddings(item_ids)
+        # Handle different scenarios based on available modalities
+        if len(modal_embeddings) == 2:
+            # Both visual and text modalities available
+            visual_semantic, text_semantic = modal_embeddings
+            
+            if self.emb_type == "semantic":
+                # Only semantic information, no ID injection
+                # Apply cross-modal attention
+                enhanced_visual, enhanced_text = self.cross_modal_attention(visual_semantic, text_semantic)
+                
+                # Fuse enhanced modalities
+                fused_input = torch.cat([enhanced_visual, enhanced_text], dim=-1)
+                fused_semantic = self.fusion_layer(fused_input)
+                
+                return fused_semantic
+            
+            elif self.emb_type == "id":
+                # Only ID embeddings, no semantic information
+                unified_id_emb = self.unified_id_embeddings(item_ids)
+                # Create zero semantic base and inject ID
+                zero_semantic = torch.zeros(item_ids.size(0), self.embedding_dim, 
+                                          device=item_ids.device, dtype=torch.float32)
+                return self.unified_null_space.inject(zero_semantic, unified_id_emb, cover=True)
+            
+            else:  # "both" - semantic + ID
+                # Apply cross-modal attention to enhance semantic representations
+                enhanced_visual, enhanced_text = self.cross_modal_attention(visual_semantic, text_semantic)
+                
+                # Fuse enhanced modalities
+                fused_input = torch.cat([enhanced_visual, enhanced_text], dim=-1)
+                fused_semantic = self.fusion_layer(fused_input)
+                
+                # Inject unified ID embeddings into the fused space
+                unified_id_emb = self.unified_id_embeddings(item_ids)
+                final_embedding = self.unified_null_space.inject(fused_semantic, unified_id_emb, self.cover)
+                
+                return final_embedding
         
-        if emb_type == "semantic":
-            return semantic_emb
-        elif emb_type == "id":
-            # 只返回ID嵌入部分
-            id_emb = self.v_ID_embeddings(item_ids)
-            result = torch.zeros_like(semantic_emb)
-            result[..., -self.v_nullity:] = id_emb
-            return result
-        else:  # "both"
-            # 融合语义嵌入和ID嵌入
-            id_emb = self.v_ID_embeddings(item_ids)  # 这里有梯度
-            result = semantic_emb.clone()  # 从冻结嵌入复制
+        elif len(modal_embeddings) == 1:
+            # Only one modality available
+            single_semantic = modal_embeddings[0]
             
-            if self.cover:
-                # 覆盖模式：用ID嵌入替换零空间
-                result[..., -self.v_nullity:] = id_emb
-            else:
-                # 叠加模式：在零空间上加上ID嵌入
-                result[..., -self.v_nullity:] = semantic_emb[..., -self.v_nullity:] + id_emb
+            if self.emb_type == "semantic":
+                # Project single modality to full dimension
+                return self.single_modal_proj(single_semantic)
             
-            return result
+            elif self.emb_type == "id":
+                # Only ID embeddings
+                unified_id_emb = self.unified_id_embeddings(item_ids)
+                zero_semantic = torch.zeros(item_ids.size(0), self.embedding_dim,
+                                          device=item_ids.device, dtype=torch.float32)
+                return self.unified_null_space.inject(zero_semantic, unified_id_emb, cover=True)
+            
+            else:  # "both"
+                # Project to full dimension and inject ID
+                projected_semantic = self.single_modal_proj(single_semantic)
+                unified_id_emb = self.unified_id_embeddings(item_ids)
+                final_embedding = self.unified_null_space.inject(projected_semantic, unified_id_emb, self.cover)
+                
+                return final_embedding
+        
+        else:
+            # No modalities available - should not happen in practice
+            raise ValueError("No visual or text features available")
+
+
+# 新增的 AlphaFuse 的物品嵌入模块 (保持向后兼容)
+class AlphaFuseItemEmbedder(nn.Module):
     
-    def _inject_text(self, item_ids, emb_type):
-        """文本模态的注入逻辑"""
-        # 获取语义嵌入（冻结，不参与梯度计算）
-        semantic_emb = self.text_semantic_embeddings(item_ids)
+    def __init__(self, v_feat, t_feat, device, embedding_dim, null_thres, null_dim, 
+                 standardization, cover, ID_space, inject_space, emb_init_type, emb_type):
+        super(AlphaFuseItemEmbedder, self).__init__()
         
-        if emb_type == "semantic":
-            return semantic_emb
-        elif emb_type == "id":
-            # 只返回ID嵌入部分
-            id_emb = self.t_ID_embeddings(item_ids)
-            result = torch.zeros_like(semantic_emb)
-            result[..., -self.t_nullity:] = id_emb
-            return result
-        else:  # "both"
-            # 融合语义嵌入和ID嵌入
-            id_emb = self.t_ID_embeddings(item_ids)  # 这里有梯度
-            result = semantic_emb.clone()  # 从冻结嵌入复制
-            
-            if self.cover:
-                # 覆盖模式：用ID嵌入替换零空间
-                result[..., -self.t_nullity:] = id_emb
-            else:
-                # 叠加模式：在零空间上加上ID嵌入
-                result[..., -self.t_nullity:] = semantic_emb[..., -self.t_nullity:] + id_emb
-            
-            return result
+        self.embedding_dim = embedding_dim
+        self.v_feat = v_feat
+        self.t_feat = t_feat
+        self.device = device
+        
+        # Use improved multi-modal AlphaFuse
+        self.multi_modal_fuser = MultiModalAlphaFuse(
+            v_feat=v_feat,
+            t_feat=t_feat,
+            device=device,
+            embedding_dim=embedding_dim,
+            null_thres=null_thres,
+            null_dim=null_dim,
+            standardization=standardization,
+            cover=cover,
+            ID_space=ID_space,
+            inject_space=inject_space,
+            emb_init_type=emb_init_type,
+            emb_type=emb_type
+        )
+    
+    def forward(self, item_ids):
+        """
+        Forward pass using improved multi-modal fusion
+        """
+        return self.multi_modal_fuser(item_ids)
